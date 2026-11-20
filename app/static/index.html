@@ -62,6 +62,16 @@
         padding: 10px; overflow: auto; font-size: 12px; max-height: 260px; }
   .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; }
   .sep { height: 1px; background: var(--line); margin: 16px 0; }
+  .mg { border: 1px dashed var(--line); border-radius: 8px; padding: 10px; margin-top: 10px; }
+  .mg-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .mg-head input { width: 130px; }
+  .mg .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .grp-tag { display:inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+             border: 1px solid var(--line); margin-right: 6px; }
+  .grp-tag.ok { color: var(--ok); border-color: rgba(61,220,151,.45); }
+  .grp-tag.bad { color: var(--bad); border-color: rgba(255,107,107,.45); }
+  .sub-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  .sub-card h3 { margin: 0 0 6px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -105,14 +115,40 @@
       <label>内置样例</label>
       <div class="samples" id="samples"></div>
 
+      <div class="sep"></div>
+      <h2 style="margin:0 0 4px;">合并试算（可选）</h2>
+      <div class="hint" style="margin-bottom:8px;">
+        用当前微批做一步 SGD，取更新后的共享权重 W′，比较候选组词分别作前缀时的
+        续写分布（全词表 softmax 归一化，分块计算、词表轴 ≤128）。每组 2～8 个
+        <b>互不相同</b>的词号，1～4 组且各组<b>互不重叠</b>；阈值取 0～1 的总变差。
+        超限组整组撤销、成员恢复独立输出项后重检其余组。
+      </div>
+      <label for="tv-threshold">总变差阈值 threshold（0–1）</label>
+      <input id="tv-threshold" type="number" value="0.05" step="0.001" min="0" max="1" />
+      <label>候选组词号（逗号或空格分隔，每组 2–8 个）</label>
+      <div id="merge-groups"></div>
+      <div style="margin-top:10px; display:flex; gap:8px;">
+        <button id="add-group" type="button">+ 添加候选组</button>
+        <button id="clear-groups" type="button">清空候选组</button>
+      </div>
+
       <div style="margin-top:16px;">
         <button id="run" class="primary" type="button">运行对照</button>
+        <button id="run-merge" type="button">运行合并试算</button>
         <span id="status" class="pill" style="margin-left:8px;">就绪</span>
       </div>
       <div id="error" class="err" style="margin-top:10px;"></div>
     </section>
 
     <section style="display:grid; gap:20px;">
+      <div class="card" id="merge-card" hidden>
+        <h2>合并试算结果</h2>
+        <div id="merge-verdict" class="verdict idle">尚未试算</div>
+        <div id="merge-summary"></div>
+        <div id="merge-mergeable"></div>
+        <div id="merge-revoked"></div>
+        <div id="merge-memory" class="hint"></div>
+      </div>
       <div class="card">
         <h2>结论</h2>
         <div id="verdict" class="verdict idle">尚未运行</div>
@@ -225,6 +261,182 @@ function collectPayload() {
   };
 }
 
+// ---------------- 合并试算：候选组 ----------------
+const MAX_GROUPS = 4, MAX_MEMBERS = 8;
+
+function addMergeGroup(text) {
+  const wrap = document.createElement("div");
+  wrap.className = "mg";
+  wrap.innerHTML = `
+    <div class="mg-head">
+      <span class="grp-label">候选组</span>
+      <button type="button" class="remove-group">删除</button>
+    </div>
+    <input class="mg-ids" spellcheck="false" placeholder="例如：4, 7, 9" />
+    <div class="meta"></div>`;
+  wrap.querySelector(".mg-ids").value = text || "";
+  wrap.querySelector(".remove-group").addEventListener("click", () => {
+    wrap.remove(); relabelGroups();
+  });
+  wrap.querySelector(".mg-ids").addEventListener("input", () => recountGroup(wrap));
+  $("merge-groups").appendChild(wrap);
+  relabelGroups();
+}
+
+function relabelGroups() {
+  document.querySelectorAll("#merge-groups .mg").forEach((wrap, i) => {
+    wrap.querySelector(".grp-label").textContent = `候选组 ${i + 1}`;
+    recountGroup(wrap);
+  });
+}
+
+function parseGroupIds(text) {
+  const parts = text.split(/[,\s]+/).filter(Boolean);
+  if (!parts.length) throw new Error("候选组为空");
+  const ids = [];
+  for (const part of parts) {
+    const v = Number(part);
+    if (!Number.isInteger(v)) throw new Error(`词号「${part}」不是整数`);
+    ids.push(v);
+  }
+  if (ids.length < 2 || ids.length > MAX_MEMBERS)
+    throw new Error(`每组需要 2～${MAX_MEMBERS} 个词号（当前 ${ids.length} 个）`);
+  return ids;
+}
+
+function recountGroup(wrap) {
+  const meta = wrap.querySelector(".meta");
+  try {
+    const ids = parseGroupIds(wrap.querySelector(".mg-ids").value);
+    const dup = ids.length !== new Set(ids).size;
+    meta.textContent = dup ? `${ids.length} 个词号，存在重复！` : `${ids.length} 个词号`;
+    meta.style.color = dup ? "var(--bad)" : "";
+  } catch (e) {
+    meta.textContent = e.message;
+  }
+}
+
+function collectMergePayload(base) {
+  const wraps = [...document.querySelectorAll("#merge-groups .mg")];
+  if (!wraps.length) throw new Error("请至少添加 1 个候选组");
+  if (wraps.length > MAX_GROUPS) throw new Error(`候选组不能超过 ${MAX_GROUPS} 组`);
+  const groups = wraps.map((wrap) => parseGroupIds(wrap.querySelector(".mg-ids").value));
+  const seen = new Set();
+  groups.forEach((ids, gi) => {
+    for (const id of ids) {
+      if (seen.has(id)) throw new Error(`词号 ${id} 在多个候选组中出现：各组必须互不重叠`);
+      seen.add(id);
+    }
+  });
+  const threshold = Number($("tv-threshold").value);
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)
+    throw new Error("总变差阈值必须是 0～1 的数字");
+  return { ...base, merge: { threshold, groups } };
+}
+
+function clearMergeSuggestion(reason) {
+  // 试算失败时清除旧建议，避免展示过期结果。
+  $("merge-card").hidden = true;
+  $("merge-verdict").className = "verdict idle";
+  $("merge-verdict").textContent = reason || "尚未试算";
+  $("merge-summary").innerHTML = "";
+  $("merge-mergeable").innerHTML = "";
+  $("merge-revoked").innerHTML = "";
+  $("merge-memory").innerHTML = "";
+}
+
+function pairRows(pairs, threshold) {
+  return pairs.map((p) => `
+    <tr>
+      <td class="num">${p.a} ↔ ${p.b}</td>
+      <td class="num">${fmt(p.distance)}</td>
+      <td class="${p.exceeds ? "bad" : "ok"}">${p.exceeds ? `✗ 超阈值 ${threshold}` : "✓"}</td>
+    </tr>`).join("");
+}
+
+function groupBlock(g, threshold, revoked) {
+  const tag = revoked
+    ? `<span class="grp-tag bad">已撤销</span>`
+    : `<span class="grp-tag ok">可合并</span>`;
+  return `
+    <div class="sub-card">
+      <h3>${tag}候选组 ${g.candidate_index + 1}：[${g.members.join(", ")}]</h3>
+      <div class="hint">词对 ${g.pair_count} 个 ｜ 组内最大总变差 ${fmt(g.max_distance)}</div>
+      <table>
+        <thead><tr><th>词对</th><th style="text-align:right">总变差距离</th><th>判定</th></tr></thead>
+        <tbody>${pairRows(g.pairs, threshold)}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderMerge(report) {
+  $("merge-card").hidden = false;
+  const r = report.result, c = report.config, s = report.sgd, m = report.memory;
+  const verdict = $("merge-verdict");
+  verdict.className = "verdict " + (r.revoked_count === 0 ? "pass" : "fail");
+  verdict.textContent =
+    `最终可合并 ${r.mergeable_count} 组 ｜ 撤销 ${r.revoked_count} 组 ｜ 重检轮次 ${r.iterations}`;
+  $("merge-summary").innerHTML = `
+    <table><tbody>
+      <tr><th>阈值 / 候选组 / 词对</th>
+          <td class="num">${c.threshold} / ${c.candidate_groups} 组 / ${c.candidate_pairs} 对</td></tr>
+      <tr><th>一步 SGD 损失（有效 ${s.valid_tokens}/${s.token_count} token）</th>
+          <td class="num">${fmt(s.loss)}</td></tr>
+      <tr><th>更新后 W′ 范数</th><td class="num">${fmt(s.updated_weight_norm)}</td></tr>
+      <tr><th>输出项数：独立 / 按建议合并后</th>
+          <td class="num">${r.output_items_if_independent} → ${r.output_items_if_merged}</td></tr>
+    </tbody></table>`;
+  $("merge-mergeable").innerHTML = r.mergeable_groups.length
+    ? `<h3 style="margin:14px 0 2px; font-size:13px;">最终可合并的组</h3>` +
+      r.mergeable_groups.map((g) => groupBlock(g, c.threshold, false)).join("")
+    : `<div class="hint" style="margin-top:10px;">没有任何组通过阈值检查。</div>`;
+  $("merge-revoked").innerHTML = r.revoked_groups.length
+    ? `<h3 style="margin:14px 0 2px; font-size:13px;">被撤销的组（成员恢复为独立输出项）</h3>` +
+      r.revoked_groups.map((g) => groupBlock(g, c.threshold, true)).join("")
+    : "";
+  $("merge-memory").innerHTML =
+    `概率归一化：<b>${m.probability_normalization}</b> ｜ 分数/概率分块处理：` +
+    `<b class="ok">是</b> ｜ 投影词表轴上限：<b>${m.max_vocab_chunk}</b> ｜ ` +
+    `物化完整全词表分数/概率：<b class="bad">否</b>`;
+}
+
+async function runMergeTrial() {
+  const btn = $("run-merge");
+  $("error").textContent = "";
+  let payload;
+  try {
+    payload = collectMergePayload(collectPayload());
+  } catch (e) {
+    clearMergeSuggestion();          // 输入都不合法：同样清掉旧建议
+    $("error").textContent = e.message;
+    return;
+  }
+  btn.disabled = true;
+  $("status").textContent = "合并试算中…";
+  try {
+    const resp = await fetch("/api/merge-trial", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    renderMerge(body);
+    $("status").textContent = `试算完成 · 可合并 ${body.result.mergeable_count} 组`;
+    $("status").className = "pill ok";
+  } catch (e) {
+    clearMergeSuggestion();          // 试算失败：清除旧建议
+    $("error").textContent = "合并试算失败：" + e.message;
+    $("status").textContent = "试算失败";
+    $("status").className = "pill bad";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function fmt(x) {
   if (x === 0) return "0";
   if (Math.abs(x) < 1e-4 || Math.abs(x) >= 1e6) return x.toExponential(6);
@@ -334,6 +546,11 @@ function applySample(sample) {
   $("vocab").value = sample.payload.vocab_size;
   $("batches").innerHTML = "";
   sample.payload.microbatches.forEach((mb) => addBatch(mb.name, pairToText(mb.tokens)));
+  $("merge-groups").innerHTML = "";
+  if (sample.payload.merge) {
+    $("tv-threshold").value = sample.payload.merge.threshold;
+    sample.payload.merge.groups.forEach((g) => addMergeGroup(g.join(", ")));
+  }
   $("error").textContent = sample.note;
 }
 
@@ -343,9 +560,17 @@ $("add").addEventListener("click", () => {
 });
 $("clear").addEventListener("click", () => { $("batches").innerHTML = ""; recount(); });
 $("run").addEventListener("click", run);
+$("add-group").addEventListener("click", () => {
+  if (document.querySelectorAll("#merge-groups .mg").length >= MAX_GROUPS) return;
+  addMergeGroup("");
+});
+$("clear-groups").addEventListener("click", () => { $("merge-groups").innerHTML = ""; });
+$("run-merge").addEventListener("click", runMergeTrial);
 
 addBatch("dup-A", "4, 4\n4, 4\n7, 4\n4, 7");
 addBatch("dup-B", "4, 4\n9, 9\n9, -100\n4, 9");
+addMergeGroup("4, 7, 9");
+addMergeGroup("10, 11");
 loadSamples();
 </script>
 </body>

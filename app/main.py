@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .engine import ValidationError, evaluate
+from .merge import run_merge_trial
 from .samples import SAMPLES
 
 # The matrices are small (<=128 tokens, vocab <=4096, dim 16); more threads
@@ -43,5 +44,14 @@ def samples() -> dict:
 def run(payload: dict = Body(...)) -> dict:
     try:
         return evaluate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/merge-trial")
+def merge_trial(payload: dict = Body(...)) -> dict:
+    """词表合并试算：一步 SGD 后的 W' 上比较组内前缀的续写分布。"""
+    try:
+        return run_merge_trial(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
